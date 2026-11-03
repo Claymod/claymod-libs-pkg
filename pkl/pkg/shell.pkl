@@ -1,0 +1,33 @@
+/// POSIX sh helpers shared by the pkg modules.
+///
+/// The generated recipes run under `/bin/sh -c` on the host, exactly
+/// like `std.commands.Shell`. Every value that comes from a playbook
+/// (package names, URLs, paths) is single-quoted before it reaches a
+/// shell — the same rule claymod's own modules follow (see
+/// `internal/modules/shell`): never interpolate a value inside double
+/// quotes, where `$(...)` and backticks would execute.
+module pkg.shell
+
+/// Single-quotes `value` for /bin/sh. The result is always one literal
+/// word: quotes, `$`, backticks and newlines inside it are data.
+function quote(value: String): String =
+  "'" + value.replaceAll("'", "'\\''") + "'"
+
+/// Renders a listing as space-separated single-quoted shell words.
+function quoteAll(values: Listing<String>): String =
+  values.toList().map((value) -> quote(value)).join(" ")
+
+/// Reduces a resource name to a filename-safe slug. Used for repo file
+/// names and the library's own state files, so a resource name can never
+/// escape those directories. Dots are folded into dashes as well: a name
+/// of `..` must not become a parent-directory path.
+function slug(value: String): String =
+  value.replaceAll(Regex("[^A-Za-z0-9_-]"), "-")
+
+/// Returns `value` when it contains no line break, fails evaluation
+/// otherwise. Repo configuration is written into line-oriented files
+/// (`sources.list`, `.repo`), so an embedded newline is an injection.
+function singleLine(label: String, value: String): String =
+  if (value.contains("\n") || value.contains("\r"))
+    throw("pkg: \(label) must be a single line (no newlines)")
+  else value

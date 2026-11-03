@@ -1,0 +1,462 @@
+/// Package management and repository setup for the five backends claymod
+/// targets: apt (deb), dnf/yum (rpm), apk (Alpine), pacman (Arch) and
+/// brew (macOS).
+///
+/// The backend is detected **at run time** on each host, so one playbook
+/// can target a mixed fleet. Every resource compiles to a single
+/// `std.commands.Shell` op — there is no hidden Go module and no opaque
+/// helper: `claymod playbook apply --verbose` shows the exact recipe that
+/// runs, and the agent needs nothing beyond a POSIX shell.
+///
+/// Idempotence comes from the **native query** of each backend
+/// (`dpkg-query -W`, `rpm -q`, `apk info -e`, `pacman -Q`,
+/// `brew list --versions`) in the resource's guard: a converged host
+/// reports `changed = false` without invoking the installer again.
+///
+///   import "modulepath:/pkg/packages.pkl" as pkg
+///
+///   new pkg.Installed {
+///     name = "web"
+///     packages { "nginx" "curl" }
+///   }
+module pkg.packages
+
+import "modulepath:/claymod/base.pkl"
+import "modulepath:/pkg/shell.pkl" as shell
+
+/// Locates the library's host-side state directory. Root agents use
+/// /var/lib/claymod-libs-pkg; non-root agents (brew on macOS) use
+/// $XDG_STATE_HOME/claymod-libs-pkg (default ~/.local/state/...).
+/// CLAYMOD_LIBS_PKG_STATE overrides both. The directory only holds
+/// repo markers and the package-index stamp — no secrets.
+const stateDirPrelude: String = """
+  state_dir="${CLAYMOD_LIBS_PKG_STATE:-}"
+  if [ -z "$state_dir" ]; then
+    if [ "$(id -u)" = 0 ]; then
+      state_dir=/var/lib/claymod-libs-pkg
+    else
+      state_dir="${XDG_STATE_HOME:-${HOME:-/root}/.local/state}/claymod-libs-pkg"
+    fi
+  fi
+  """
+
+/// POSIX sh function body: `is_installed <package>` exits 0 when the
+/// package is installed according to the active backend, 1 when it is
+/// not, and 2 when no supported backend exists. `$1` is always a single
+/// shell word supplied by the caller.
+const installedProbe: String = """
+  if command -v apt-get >/dev/null 2>&1; then
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -qx 'install ok installed'
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    rpm -q "$1" >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then
+    apk info -e "$1" >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Q "$1" >/dev/null 2>&1
+  elif command -v brew >/dev/null 2>&1; then
+    brew list --versions "$1" >/dev/null 2>&1
+  else
+    return 2
+  fi
+  """
+
+/// Ensures a set of packages is installed.
+///
+/// Backend selection: apt-get, then dnf, then yum, then apk, then pacman,
+/// then brew. The first one found wins; a host with none fails the apply
+/// with a clear message. apt installs with `--no-install-recommends`
+/// (infrastructure hosts, not desktops) — override by installing the
+/// recommended packages explicitly.
+///
+/// Idempotent: the `unlessIf` guard asks `dpkg-query`/`rpm`/`apk`/
+/// `pacman`/`brew` about every listed package and skips the op when all
+/// are present.
+class Installed extends base.Resource {
+  type = "std.commands.Shell"
+
+  /// Packages that must be installed. Must not be empty.
+  packages: Listing<String> = new Listing {}
+
+  local wanted: Listing<String> =
+    if (packages.length == 0)
+      throw("pkg.Installed \(name): packages must not be empty")
+    else if (packages.any((p) -> p == "" || p.startsWith("-")))
+      throw("pkg.Installed \(name): package names must be non-empty and must not start with '-'")
+    else packages
+
+  local pkgs: String = shell.quoteAll(wanted)
+
+  unlessIf: String = """
+    is_installed() {
+    \(installedProbe)
+    }
+    for p in \(pkgs); do
+      is_installed "$p" || exit 1
+    done
+    exit 0
+    """
+
+  command: String = """
+    set -eu
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get install -y --no-install-recommends \(pkgs)
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y \(pkgs)
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y \(pkgs)
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache \(pkgs)
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -S --noconfirm --needed \(pkgs)
+    elif command -v brew >/dev/null 2>&1; then
+      HOMEBREW_NO_AUTO_UPDATE=1 brew install \(pkgs)
+    else
+      echo \(shell.quote("pkg.Installed \(name): no supported package manager (apt, dnf/yum, apk, pacman, brew)")) >&2
+      exit 1
+    fi
+    """
+}
+
+/// Ensures a set of packages is **not** installed.
+///
+/// This is a destructive resource, so the extra-removal behaviour is an
+/// explicit opt-in: `purge = true` maps to `apt-get purge --auto-remove`
+/// and `pacman -Rns`; the default is a plain remove (keep configuration
+/// where the backend allows it).
+///
+/// Idempotent: the guard skips the op when the backend reports every
+/// listed package as already absent.
+class Absent extends base.Resource {
+  type = "std.commands.Shell"
+
+  /// Packages that must not be installed. Must not be empty.
+  packages: Listing<String> = new Listing {}
+
+  /// Remove configuration files and orphaned dependencies too. Default
+  /// `false` — opt in explicitly.
+  purge: Boolean = false
+
+  local wanted: Listing<String> =
+    if (packages.length == 0)
+      throw("pkg.Absent \(name): packages must not be empty")
+    else if (packages.any((p) -> p == "" || p.startsWith("-")))
+      throw("pkg.Absent \(name): package names must be non-empty and must not start with '-'")
+    else packages
+
+  local pkgs: String = shell.quoteAll(wanted)
+
+  local aptRemove: String =
+    if (purge) "apt-get purge -y --auto-remove \(pkgs)" else "apt-get remove -y \(pkgs)"
+
+  local pacmanRemove: String =
+    if (purge) "pacman -Rns --noconfirm \(pkgs)" else "pacman -R --noconfirm \(pkgs)"
+
+  unlessIf: String = """
+    is_installed() {
+    \(installedProbe)
+    }
+    for p in \(pkgs); do
+      if is_installed "$p"; then exit 1; fi
+    done
+    exit 0
+    """
+
+  command: String = """
+    set -eu
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      \(aptRemove)
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf remove -y \(pkgs)
+    elif command -v yum >/dev/null 2>&1; then
+      yum remove -y \(pkgs)
+    elif command -v apk >/dev/null 2>&1; then
+      apk del \(pkgs)
+    elif command -v pacman >/dev/null 2>&1; then
+      \(pacmanRemove)
+    elif command -v brew >/dev/null 2>&1; then
+      brew uninstall \(pkgs)
+    else
+      echo \(shell.quote("pkg.Absent \(name): no supported package manager (apt, dnf/yum, apk, pacman, brew)")) >&2
+      exit 1
+    fi
+    """
+}
+
+/// Adds a third-party package repository: the signed-by key, the repo
+/// file, an optional pin priority, and an index refresh.
+///
+/// - `format = "deb"`: writes `/etc/apt/sources.list.d/<slug>.list` and
+///   `/usr/share/keyrings/<slug>.gpg`, then `apt-get update`. The suite
+///   defaults to the host's `VERSION_CODENAME` (or `UBUNTU_CODENAME`)
+///   read from `/etc/os-release`.
+/// - `format = "rpm"`: writes `/etc/yum.repos.d/<slug>.repo`, imports the
+///   key with `rpm --import`, then `dnf`/`yum makecache`.
+///
+/// Signature verification is on by default. `unsigned = true` is the
+/// explicit opt-in for a repository without a key (`trusted=yes` /
+/// `gpgcheck=0`) — never the default.
+///
+/// Idempotent: a state marker records the declared configuration; the
+/// guard skips the op when the marker, the repo file and (for deb) the
+/// keyring are all already in place. Changing any field re-applies.
+class Repo extends base.Resource {
+  type = "std.commands.Shell"
+
+  /// Base URL of the repository. HTTPS only — plaintext repos are
+  /// refused at evaluation time.
+  url: String
+
+  /// URL of the repository's public signing key (armored or binary).
+  /// Required unless `unsigned = true`.
+  key: String = ""
+
+  /// Repository format: `"deb"` (apt) or `"rpm"` (dnf/yum).
+  format: ("deb"|"rpm") = "deb"
+
+  /// Distribution suite/codename for deb repos. Empty = read from
+  /// `/etc/os-release`.
+  suite: String = ""
+
+  /// Components for deb repos (e.g. `"main"`, `"main contrib non-free"`).
+  components: String = "main"
+
+  /// Keyring path for deb repos. Empty = `/usr/share/keyrings/<slug>.gpg`.
+  keyring: String = ""
+
+  /// Pin priority. deb: an apt preferences origin pin; rpm: a dnf
+  /// `priority=`. `0` = no pin (and removes a pin this resource wrote
+  /// earlier).
+  priority: Int = 0
+
+  /// Skip signature verification — explicit opt-in, mutually exclusive
+  /// with `key`.
+  unsigned: Boolean = false
+
+  local repoName: String = shell.singleLine("pkg.Repo \(name): name", name)
+  local repoURL: String = shell.singleLine("pkg.Repo \(name): url", url)
+  local repoKey: String = shell.singleLine("pkg.Repo \(name): key", key)
+  local repoSuite: String = shell.singleLine("pkg.Repo \(name): suite", suite)
+  local repoComponents: String = shell.singleLine("pkg.Repo \(name): components", components)
+  local repoKeyringArg: String = shell.singleLine("pkg.Repo \(name): keyring", keyring)
+
+  local checked: Boolean =
+    if (!repoURL.startsWith("https://"))
+      throw("pkg.Repo \(name): url must start with https:// (plaintext repositories are refused)")
+    else if (unsigned && repoKey != "")
+      throw("pkg.Repo \(name): unsigned = true and key are mutually exclusive")
+    else if (!unsigned && repoKey == "")
+      throw("pkg.Repo \(name): key is required unless unsigned = true is set explicitly")
+    else if (repoKey != "" && !repoKey.startsWith("https://"))
+      throw("pkg.Repo \(name): key must start with https://")
+    else if (format == "rpm" && repoKeyringArg != "")
+      throw("pkg.Repo \(name): keyring is only meaningful for format = \"deb\"")
+    else if (repoKeyringArg != "" && (!repoKeyringArg.startsWith("/") || repoKeyringArg.contains(" ") || repoKeyringArg.contains("\t")))
+      throw("pkg.Repo \(name): keyring must be an absolute path without whitespace")
+    else true
+
+  local id: String = shell.slug(repoName)
+  local keyringPath: String =
+    if (repoKeyringArg == "") "/usr/share/keyrings/\(id).gpg" else repoKeyringArg
+  local repoFile: String =
+    if (format == "deb") "/etc/apt/sources.list.d/\(id).list" else "/etc/yum.repos.d/\(id).repo"
+  local prefFile: String = "/etc/apt/preferences.d/\(id).pref"
+
+  /// Everything that changes the on-host result. Stored next to the repo
+  /// file so a later apply with different fields is not skipped.
+  local config: String =
+    if (checked)
+      "\(format)|\(repoURL)|\(repoKey)|\(repoSuite)|\(repoComponents)|\(keyringPath)|\(priority)|\(unsigned)"
+    else ""
+
+  local qConfig: String = shell.quote(config)
+  local qRepoFile: String = shell.quote(repoFile)
+  local qRepoURL: String = shell.quote(repoURL)
+  local qKeyring: String = shell.quote(keyringPath)
+  local qRepoKey: String = shell.quote(repoKey)
+  local qId: String = shell.quote(id)
+  local qRepoName: String = shell.quote(repoName)
+  local qSuite: String = shell.quote(repoSuite)
+  local qComponents: String = shell.quote(repoComponents)
+  local qPrefFile: String = shell.quote(prefFile)
+  local qDisplayName: String = shell.quote("# Managed by claymod-libs-pkg (pkg.Repo \(repoName)). Do not edit.")
+
+  local keyringGuard: String =
+    if (format == "deb" && repoKey != "") "[ -s \(qKeyring) ] || exit 1" else ""
+
+  local pinGuard: String =
+    if (format == "deb" && priority > 0) "[ -f \(qPrefFile) ] || exit 1" else ""
+
+  local debOptions: String =
+    if (repoKey == "") "trusted=yes" else "signed-by=" + keyringPath
+
+  local keyInstallDeb: String =
+    if (repoKey == "")
+      ": # unsigned repository: no key to install"
+    else """
+      curl -fsSL --proto '=https' --tlsv1.2 --retry 3 \(qRepoKey) -o "$tmp_key"
+      if grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$tmp_key"; then
+        gpg --batch --yes --dearmor -o "$keyring" < "$tmp_key"
+      else
+        install -m 0644 "$tmp_key" "$keyring"
+      fi
+      chmod 0644 "$keyring"
+      """
+
+  local keyImportRpm: String =
+    if (repoKey == "")
+      ": # unsigned repository: no key to import"
+    else """
+      curl -fsSL --proto '=https' --tlsv1.2 --retry 3 \(qRepoKey) -o "$tmp_key"
+      rpm --import "$tmp_key"
+      """
+
+  local priorityDeb: String =
+    if (priority > 0)
+      """
+      url=\(qRepoURL)
+      host=${url#*://}
+      host=${host%%/*}
+      printf 'Package: *\\nPin: origin %s\\nPin-Priority: %s\\n' "$host" \(shell.quote("\(priority)")) > \(qPrefFile)
+      """
+    else "rm -f \(qPrefFile)"
+
+  local gpgKeyLine: String =
+    if (repoKey != "") "printf 'gpgkey=%s\\n' \(qRepoKey)" else ""
+
+  local priorityLine: String =
+    if (priority > 0) "printf 'priority=%s\\n' \(shell.quote("\(priority)"))" else ""
+
+  local debCommand: String = """
+    set -eu
+    umask 022
+    \(stateDirPrelude)
+    command -v apt-get >/dev/null 2>&1 || { echo \(shell.quote("pkg.Repo \(repoName): apt-get not found (format = deb)")) >&2; exit 1; }
+    mkdir -p "$state_dir/repos" /etc/apt/sources.list.d /usr/share/keyrings /etc/apt/preferences.d
+    repo=\(qRepoFile)
+    keyring=\(qKeyring)
+    state="$state_dir/repos/\(id).state"
+    . /etc/os-release 2>/dev/null || true
+    suite=\(qSuite)
+    [ -n "$suite" ] || suite="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+    [ -n "$suite" ] || { echo \(shell.quote("pkg.Repo \(repoName): cannot determine the distribution codename; set suite")) >&2; exit 1; }
+    tmp_key=$(mktemp)
+    tmp_repo=$(mktemp)
+    trap 'rm -f "$tmp_key" "$tmp_repo"' EXIT
+    \(keyInstallDeb)
+    {
+      printf '%s\\n' \(qDisplayName)
+      printf 'deb [%s] %s %s %s\\n' \(shell.quote(debOptions)) \(qRepoURL) "$suite" \(qComponents)
+    } > "$tmp_repo"
+    install -m 0644 "$tmp_repo" "$repo"
+    \(priorityDeb)
+    apt-get update -qq
+    mkdir -p "$state_dir"
+    : > "$state_dir/package-index.stamp"
+    printf '%s\\n' \(qConfig) > "$state"
+    """
+
+  local rpmCommand: String = """
+    set -eu
+    umask 022
+    \(stateDirPrelude)
+    mkdir -p "$state_dir/repos" /etc/yum.repos.d
+    repo=\(qRepoFile)
+    state="$state_dir/repos/\(id).state"
+    tmp_key=$(mktemp)
+    tmp_repo=$(mktemp)
+    trap 'rm -f "$tmp_key" "$tmp_repo"' EXIT
+    \(keyImportRpm)
+    {
+      printf '[%s]\\n' \(qId)
+      printf 'name=%s\\n' \(qRepoName)
+      printf 'baseurl=%s\\n' \(qRepoURL)
+      printf 'enabled=1\\n'
+      printf 'gpgcheck=%s\\n' \(if (unsigned) "0" else "1")
+      \(gpgKeyLine)
+      \(priorityLine)
+    } > "$tmp_repo"
+    install -m 0644 "$tmp_repo" "$repo"
+    if command -v dnf >/dev/null 2>&1; then
+      dnf -q makecache
+    elif command -v yum >/dev/null 2>&1; then
+      yum -q makecache
+    else
+      echo \(shell.quote("pkg.Repo \(repoName): no dnf or yum found")) >&2
+      exit 1
+    fi
+    mkdir -p "$state_dir"
+    : > "$state_dir/package-index.stamp"
+    printf '%s\\n' \(qConfig) > "$state"
+    """
+
+  unlessIf: String = """
+    \(stateDirPrelude)
+    state="$state_dir/repos/\(id).state"
+    [ -f "$state" ] || exit 1
+    [ "$(cat "$state" 2>/dev/null)" = \(qConfig) ] || exit 1
+    [ -f \(qRepoFile) ] || exit 1
+    grep -qF -- \(qRepoURL) \(qRepoFile) || exit 1
+    \(keyringGuard)
+    \(pinGuard)
+    exit 0
+    """
+
+  command: String = if (format == "deb") debCommand else rpmCommand
+}
+
+/// Refreshes the package index (metadata only — it never upgrades a
+/// package).
+///
+/// The resource is a TTL: the apply runs the backend's own refresh
+/// (`apt-get update`, `dnf/yum makecache`, `apk update`, `pacman -Sy`,
+/// `brew update`) and records a stamp; a later apply within
+/// `maxAgeMinutes` reports `changed = false`. This is the same
+/// `cache_valid_time` idea Ansible's apt module uses, implemented with a
+/// file this library owns so it behaves the same on every backend.
+///
+/// The stamp is shared by every `pkg.Updated` resource on a host: the
+/// package index is one thing, not one per playbook resource.
+class Updated extends base.Resource {
+  type = "std.commands.Shell"
+
+  /// Reuse a stamp younger than this many minutes. Must be at least 1.
+  maxAgeMinutes: Int = 60
+
+  local age: Int =
+    if (maxAgeMinutes < 1)
+      throw("pkg.Updated \(name): maxAgeMinutes must be >= 1")
+    else maxAgeMinutes
+
+  unlessIf: String = """
+    \(stateDirPrelude)
+    stamp="$state_dir/package-index.stamp"
+    [ -f "$stamp" ] || exit 1
+    [ -n "$(find "$stamp" -mmin -\(age) 2>/dev/null)" ] || exit 1
+    exit 0
+    """
+
+  command: String = """
+    set -eu
+    \(stateDirPrelude)
+    mkdir -p "$state_dir"
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf -q makecache
+    elif command -v yum >/dev/null 2>&1; then
+      yum -q makecache
+    elif command -v apk >/dev/null 2>&1; then
+      apk update
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Sy --noconfirm
+    elif command -v brew >/dev/null 2>&1; then
+      brew update
+    else
+      echo \(shell.quote("pkg.Updated \(name): no supported package manager (apt, dnf/yum, apk, pacman, brew)")) >&2
+      exit 1
+    fi
+    : > "$state_dir/package-index.stamp"
+    """
+}
