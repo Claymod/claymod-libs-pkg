@@ -1,0 +1,6 @@
+# Test project for the library's own fixtures: resolves `modulepath:/pkg/…`
+# from this checkout (a plain local directory — no git, no network).
+version: 1
+libraries:
+  - name: pkg
+    path: ../pkl

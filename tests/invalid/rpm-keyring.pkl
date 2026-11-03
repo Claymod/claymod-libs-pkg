@@ -1,0 +1,13 @@
+amends "modulepath:/claymod/base.pkl"
+
+import "modulepath:/pkg/packages.pkl" as pkg
+
+resources {
+  new pkg.Repo {
+    name = "rpm-keyring"
+    url = "https://packages.example.com/rpm"
+    key = "https://packages.example.com/RPM-GPG-KEY"
+    format = "rpm"
+    keyring = "/usr/share/keyrings/unused.gpg"
+  }
+}

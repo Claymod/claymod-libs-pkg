@@ -1,0 +1,11 @@
+amends "modulepath:/claymod/base.pkl"
+
+import "modulepath:/pkg/packages.pkl" as pkg
+
+resources {
+  new pkg.Repo {
+    name = "plaintext-url"
+    url = "http://packages.example.com/deb"
+    key = "https://packages.example.com/key.asc"
+  }
+}

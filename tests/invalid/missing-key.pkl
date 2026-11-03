@@ -1,0 +1,10 @@
+amends "modulepath:/claymod/base.pkl"
+
+import "modulepath:/pkg/packages.pkl" as pkg
+
+resources {
+  new pkg.Repo {
+    name = "missing-key"
+    url = "https://packages.example.com/deb"
+  }
+}

@@ -1,0 +1,64 @@
+/// Evaluation and shell-test fixture for claymod-libs-pkg.
+///
+/// This playbook is never applied to a real host: the repository URLs are
+/// deliberately fake and the shell tests substitute stub backends on PATH.
+/// It exists to prove that every pkg resource evaluates, serializes as a
+/// `std.commands.Shell` op, and generates a recipe the test suite can run
+/// hermetically.
+amends "modulepath:/claymod/base.pkl"
+
+import "modulepath:/pkg/packages.pkl" as pkg
+
+hosts {
+  "pkg-test"
+}
+
+resources {
+  new pkg.Updated {
+    name = "index"
+    maxAgeMinutes = 45
+  }
+
+  new pkg.Repo {
+    name = "repo-deb"
+    url = "https://packages.example.com/deb"
+    key = "https://packages.example.com/deb/key.asc"
+    format = "deb"
+    suite = "bookworm"
+    components = "main contrib"
+    priority = 500
+  }
+
+  new pkg.Repo {
+    name = "repo-rpm"
+    url = "https://packages.example.com/rpm/$releasever/$basearch"
+    key = "https://packages.example.com/rpm/RPM-GPG-KEY"
+    format = "rpm"
+  }
+
+  new pkg.Installed {
+    name = "installed"
+    packages {
+      "nginx"
+      "curl"
+    }
+    dependsOn {
+      "repo-deb"
+    }
+  }
+
+  new pkg.Absent {
+    name = "absent"
+    packages {
+      "telnet"
+    }
+  }
+
+  new pkg.Absent {
+    name = "absent-purge"
+    packages {
+      "telnet"
+    }
+    purge = true
+  }
+}

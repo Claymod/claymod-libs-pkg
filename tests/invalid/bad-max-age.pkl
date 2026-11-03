@@ -1,0 +1,10 @@
+amends "modulepath:/claymod/base.pkl"
+
+import "modulepath:/pkg/packages.pkl" as pkg
+
+resources {
+  new pkg.Updated {
+    name = "bad-max-age"
+    maxAgeMinutes = 0
+  }
+}

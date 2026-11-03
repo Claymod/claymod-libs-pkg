@@ -1,0 +1,12 @@
+amends "modulepath:/claymod/base.pkl"
+
+import "modulepath:/pkg/packages.pkl" as pkg
+
+resources {
+  new pkg.Installed {
+    name = "dash-package"
+    packages {
+      "--force-yes"
+    }
+  }
+}
