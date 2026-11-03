@@ -22,13 +22,12 @@ jobs:
       - uses: actions/checkout@v4
 
       # The library imports modulepath:/claymod/base.pkl, which ships in
-      # the main (private) claymod repository. The org's CI token needs
-      # read access to Claymod/Claymod.
+      # the public Claymod/Claymod repository. A public checkout needs no
+      # secret: actions/checkout uses the default workflow token.
       - name: Check out the claymod schema
         uses: actions/checkout@v4
         with:
           repository: Claymod/Claymod
-          token: ${{ secrets.CLAYMOD_REPO_TOKEN }}
           path: claymod
 
       - uses: actions/setup-go@v5
