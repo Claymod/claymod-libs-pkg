@@ -1,0 +1,41 @@
+/// Fixture for the Docker simulation: installs and removes one small
+/// package that every tested distribution ships in its main repository.
+///
+/// The simulation (tests/docker_simulate.sh, run in CI) executes the
+/// generated recipes inside debian, fedora, alpine and archlinux images:
+/// refresh index -> guard must want to install -> install -> guard must
+/// skip -> guard must want to remove -> remove -> guard must skip.
+amends "modulepath:/claymod/base.pkl"
+
+import "modulepath:/pkg/packages.pkl" as pkg
+
+hosts {
+  "ci"
+}
+
+resources {
+  new pkg.Updated {
+    name = "index"
+    maxAgeMinutes = 1
+  }
+
+  new pkg.Installed {
+    name = "tree-installed"
+    packages {
+      "tree"
+    }
+    dependsOn {
+      "index"
+    }
+  }
+
+  new pkg.Absent {
+    name = "tree-absent"
+    packages {
+      "tree"
+    }
+    dependsOn {
+      "tree-installed"
+    }
+  }
+}

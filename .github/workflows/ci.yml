@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned: a pkl upgrade is a deliberate change, never a CI surprise.
+  PKL_VERSION: "0.32.2"
+
+jobs:
+  validate:
+    name: Validate (pkl + hermetic tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The library imports modulepath:/claymod/base.pkl, which ships in
+      # the main (private) claymod repository. The org's CI token needs
+      # read access to Claymod/Claymod.
+      - name: Check out the claymod schema
+        uses: actions/checkout@v4
+        with:
+          repository: Claymod/Claymod
+          token: ${{ secrets.CLAYMOD_REPO_TOKEN }}
+          path: claymod
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: claymod/go.mod
+          cache-dependency-path: claymod/go.sum
+
+      - name: Install pkl
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/pkl" \
+            "https://github.com/apple/pkl/releases/download/${PKL_VERSION}/pkl-linux-amd64"
+          chmod +x "$RUNNER_TEMP/pkl"
+          echo "$RUNNER_TEMP" >>"$GITHUB_PATH"
+
+      - name: Build the claymod CLI
+        run: cd claymod && go build -o "$RUNNER_TEMP/claymod" ./cmd/claymod
+
+      - name: Tests
+        env:
+          PKL: ${{ runner.temp }}/pkl
+          CLAYMOD: ${{ runner.temp }}/claymod
+          CLAYMOD_SCHEMA: ${{ github.workspace }}/claymod/pkl
+        run: sh tests/run.sh
+
+      - name: Evaluate the simulation fixture
+        env:
+          PKL: ${{ runner.temp }}/pkl
+          CLAYMOD_SCHEMA: ${{ github.workspace }}/claymod/pkl
+        run: |
+          "$PKL" eval --format json --color never \
+            --module-path "$PWD/pkl:$CLAYMOD_SCHEMA" \
+            tests/playbook.ci.pkl >tests/.build/playbook-ci.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playbook-ci
+          path: tests/.build/playbook-ci.json
+          retention-days: 1
+
+  simulate:
+    name: Simulate (${{ matrix.image }})
+    needs: validate
+    # Real package managers, real repositories: worth the minutes on main
+    # and on tags, not on every pull request. workflow_dispatch runs it too.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:12
+          - debian:13
+          - fedora:latest
+          - alpine:latest
+          - archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: playbook-ci
+          path: tests/.build
+
+      - name: Run the pkg recipes in ${{ matrix.image }}
+        run: sh tests/docker_simulate.sh "${{ matrix.image }}" tests/.build/playbook-ci.json
