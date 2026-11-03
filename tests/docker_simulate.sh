@@ -21,7 +21,12 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/claymod-pkg-sim.XXXXXX")
+# The work dir must live inside the checkout: Docker Desktop on macOS does
+# not share $TMPDIR (/var/folders/...), so a /tmp mount arrives empty.
+BUILD="$ROOT/tests/.build"
+mkdir -p "$BUILD"
+WORK="$BUILD/sim.$$"
+mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
 for resource in index tree-installed tree-absent; do
