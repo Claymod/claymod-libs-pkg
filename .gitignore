@@ -1,0 +1,12 @@
+# Tidet resources are synced by Tidet Cloud, never by Git.
+.tidet/
+.tidet-scratch/
+
+# Reference checkout of the main claymod repository (not part of this
+# library; tests/run.sh uses it when present for the std schema).
+.claymod/
+
+# Local test output
+tests/.build/
+__pycache__/
+*.pyc
