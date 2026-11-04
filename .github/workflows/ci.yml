@@ -10,54 +10,46 @@ on:
 permissions:
   contents: read
 
-env:
-  # Pinned: a pkl upgrade is a deliberate change, never a CI surprise.
-  PKL_VERSION: "0.32.2"
-
 jobs:
   validate:
     name: Validate (pkl + hermetic tests)
     runs-on: ubuntu-latest
+    # The control-server image ships the full claymod CLI, the pkl CLI and
+    # git — everything this job used to install and build. It tracks the
+    # default branch of Claymod/Claymod, so CI breaks early if claymod
+    # changes something the library depends on; pin a sha-<sha> tag here
+    # if reproducibility ever matters more than early signal.
+    container:
+      image: ghcr.io/claymod/claymod:latest
     steps:
       - uses: actions/checkout@v4
 
-      # The library imports modulepath:/claymod/base.pkl, which ships in
-      # the public Claymod/Claymod repository. A public checkout needs no
-      # secret: actions/checkout uses the default workflow token.
+      # The test tooling (extract.py, check_ops.py) needs python3; the
+      # image is bookworm-slim and does not carry it.
+      - name: Install python3
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3
+
+      # The library imports modulepath:/claymod/base.pkl. Testing against
+      # the source schema (not the image's embedded copy) validates the
+      # fixture against claymod's current schema as it evolves. A public
+      # checkout needs no secret: actions/checkout uses the default
+      # workflow token.
       - name: Check out the claymod schema
         uses: actions/checkout@v4
         with:
           repository: Claymod/Claymod
           path: claymod
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: claymod/go.mod
-          cache-dependency-path: claymod/go.sum
-
-      - name: Install pkl
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/pkl" \
-            "https://github.com/apple/pkl/releases/download/${PKL_VERSION}/pkl-linux-amd64"
-          chmod +x "$RUNNER_TEMP/pkl"
-          echo "$RUNNER_TEMP" >>"$GITHUB_PATH"
-
-      - name: Build the claymod CLI
-        run: cd claymod && go build -o "$RUNNER_TEMP/claymod" ./cmd/claymod
-
       - name: Tests
         env:
-          PKL: ${{ runner.temp }}/pkl
-          CLAYMOD: ${{ runner.temp }}/claymod
           CLAYMOD_SCHEMA: ${{ github.workspace }}/claymod/pkl
         run: sh tests/run.sh
 
       - name: Evaluate the simulation fixture
         env:
-          PKL: ${{ runner.temp }}/pkl
           CLAYMOD_SCHEMA: ${{ github.workspace }}/claymod/pkl
         run: |
-          "$PKL" eval --format json --color never \
+          pkl eval --format json --color never \
             --module-path "$PWD/pkl:$CLAYMOD_SCHEMA" \
             tests/playbook.ci.pkl >tests/.build/playbook-ci.json
 
